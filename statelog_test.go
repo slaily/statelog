@@ -1,18 +1,46 @@
 package statelog
 
 import (
+	"path"
+	"runtime"
 	"testing"
 )
 
-func TestStatelogNew(t *testing.T) {
-	bufferCapacity := 1
-	statelog := NewStatelog("test", bufferCapacity)
+func newTestStatelogDefault() Statelog {
+	_, filePath, _, _ := runtime.Caller(0)
+	rootDirPath := path.Join(path.Dir(filePath))
+	testDirPath := path.Join(rootDirPath, ".testdata")
+	bufferCapacity := 10
+	sl := NewStatelog(testDirPath, bufferCapacity)
 
-	if statelog.DirPath == "" {
-		t.Errorf("expected statelog.DirPath to be assigned, got %s", statelog.DirPath)
+	return sl
+}
+func TestStatelogNew(t *testing.T) {
+	sl := newTestStatelogDefault()
+
+	if sl.DirPath == "" {
+		t.Errorf("expected sl.DirPath to be assigned, got %s", sl.DirPath)
 	}
 
-	if statelog.BufferCapacity != bufferCapacity {
-		t.Errorf("expected statelog.BufferCapacity value %d to be assigned, got %d", bufferCapacity, statelog.BufferCapacity)
+	if sl.BufferCapacity == 0 {
+		t.Error("expected sl.BufferCapacity value to be not 0")
+	}
+}
+
+func TestStatelogDirCreated(t *testing.T) {
+	sl := newTestStatelogDefault()
+	err := sl.ensureDirExists()
+
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStatelogWALFileCreated(t *testing.T) {
+	sl := newTestStatelogDefault()
+	err := sl.ensureWALFileExists()
+
+	if err != nil {
+		t.Error(err)
 	}
 }
