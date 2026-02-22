@@ -24,26 +24,26 @@ type Encoder interface {
 type DefaultEncoder struct{}
 
 func (DefaultEncoder) Encode(data any) ([]byte, byte, error) {
-	switch v := data.(type) {
+	switch str := data.(type) {
 	case string:
-		return []byte(v), TypeString, nil
+		return []byte(str), TypeString, nil
 	default:
-		b, err := json.Marshal(v)
+		encoded, err := json.Marshal(data)
 		if err != nil {
 			return nil, 0, fmt.Errorf("statelog: json encode: %w", err)
 		}
-		return b, TypeJSON, nil
+		return encoded, TypeJSON, nil
 	}
 }
 
 func (DefaultEncoder) Decode(payload []byte, typeFlag byte) (any, error) {
 	switch typeFlag {
 	case TypeJSON:
-		var v any
-		if err := json.Unmarshal(payload, &v); err != nil {
+		var decoded any
+		if err := json.Unmarshal(payload, &decoded); err != nil {
 			return nil, fmt.Errorf("statelog: json decode: %w", err)
 		}
-		return v, nil
+		return decoded, nil
 	case TypeString:
 		return string(payload), nil
 	default:
