@@ -1,7 +1,8 @@
 // Package statelog provides a high-performance, goroutine-safe, durable
-// Write-Ahead Log (WAL). Records are queued in memory and flushed to disk
-// by a background goroutine, combining low-latency appends with strong
-// durability guarantees via fsync.
+// Write-Ahead Log (WAL) with fixed-size records. The record schema is derived
+// from a Go struct — the struct IS the schema. Records are queued in memory
+// and flushed to disk by a background goroutine, combining low-latency
+// appends with strong durability guarantees via fsync.
 package statelog
 
 import (
@@ -16,12 +17,13 @@ import (
 )
 
 // StateLog is a durable, append-only log backed by a binary file on disk.
-type StateLog struct {
+// The type parameter T defines the fixed-size record schema.
+type StateLog[T any] struct {
 	filePath       string
 	file           *os.File
 	inode          uint64
-	encoder        Encoder
-	queue          chan any
+	schema         *Schema
+	queue          chan []byte
 	done           chan struct{}
 	stopped        chan struct{}
 	closed         atomic.Bool
@@ -31,13 +33,19 @@ type StateLog struct {
 	fileHeaderSize uint16
 }
 
-// New creates a StateLog that writes to filePath. The parent directory is
-// created if it does not exist. A background goroutine is started to
-// periodically flush queued records to disk.
-func New(filePath string, opts ...Option) (*StateLog, error) {
+// New creates a StateLog that writes to filePath. The record schema is
+// derived from the struct type T. The parent directory is created if it
+// does not exist. A background goroutine is started to periodically flush
+// queued records to disk.
+func New[T any](filePath string, opts ...Option) (*StateLog[T], error) {
 	cfg := defaultConfig()
 	for _, o := range opts {
 		o(&cfg)
+	}
+
+	schema, err := buildSchema[T]()
+	if err != nil {
+		return nil, err
 	}
 
 	absPath, err := filepath.Abs(filePath)
@@ -49,10 +57,10 @@ func New(filePath string, opts ...Option) (*StateLog, error) {
 		return nil, &IOError{FilePath: absPath, Message: "create parent directory", Err: err}
 	}
 
-	s := &StateLog{
+	s := &StateLog[T]{
 		filePath:       absPath,
-		encoder:        cfg.encoder,
-		queue:          make(chan any, cfg.maxQueueSize),
+		schema:         schema,
+		queue:          make(chan []byte, cfg.maxQueueSize),
 		done:           make(chan struct{}),
 		stopped:        make(chan struct{}),
 		cfg:            cfg,
@@ -71,12 +79,18 @@ func New(filePath string, opts ...Option) (*StateLog, error) {
 // Append queues a record for durable persistence. It returns immediately
 // without blocking on disk I/O. Returns ErrQueueFull if the in-memory queue
 // is at capacity, or ErrClosed if the log has been closed.
-func (s *StateLog) Append(data any) error {
+func (s *StateLog[T]) Append(data T) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+
+	buf, err := encodeRecord(s.schema, data)
+	if err != nil {
+		return err
+	}
+
 	select {
-	case s.queue <- data:
+	case s.queue <- buf:
 		return nil
 	default:
 		return ErrQueueFull
@@ -85,7 +99,7 @@ func (s *StateLog) Append(data any) error {
 
 // Close flushes all pending records to disk, stops the background goroutine,
 // and closes the underlying file. It is safe to call multiple times.
-func (s *StateLog) Close() error {
+func (s *StateLog[T]) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
@@ -101,7 +115,7 @@ func (s *StateLog) Close() error {
 	return s.file.Close()
 }
 
-func (s *StateLog) commitLoop() {
+func (s *StateLog[T]) commitLoop() {
 	defer close(s.stopped)
 	ticker := time.NewTicker(s.cfg.commitInterval)
 	defer ticker.Stop()
@@ -116,16 +130,12 @@ func (s *StateLog) commitLoop() {
 	}
 }
 
-func (s *StateLog) commit() error {
+func (s *StateLog[T]) commit() error {
 	var entries [][]byte
 	for {
 		select {
-		case data := <-s.queue:
-			entry, err := formatEntry(s.encoder, data)
-			if err != nil {
-				continue
-			}
-			entries = append(entries, entry)
+		case buf := <-s.queue:
+			entries = append(entries, buf)
 		default:
 			goto write
 		}
@@ -144,7 +154,7 @@ write:
 	return s.syncToDisk(entries)
 }
 
-func (s *StateLog) syncToDisk(entries [][]byte) error {
+func (s *StateLog[T]) syncToDisk(entries [][]byte) error {
 	if err := s.detectRotation(); err != nil {
 		return err
 	}
@@ -166,7 +176,7 @@ func (s *StateLog) syncToDisk(entries [][]byte) error {
 	return nil
 }
 
-func (s *StateLog) detectRotation() error {
+func (s *StateLog[T]) detectRotation() error {
 	info, err := os.Stat(s.filePath)
 	if os.IsNotExist(err) {
 		return s.reopenFile()
@@ -183,7 +193,7 @@ func (s *StateLog) detectRotation() error {
 	return nil
 }
 
-func (s *StateLog) reopenFile() error {
+func (s *StateLog[T]) reopenFile() error {
 	if s.file != nil {
 		s.file.Close()
 	}
@@ -210,8 +220,8 @@ func (s *StateLog) reopenFile() error {
 	return s.loadFileHeader()
 }
 
-func (s *StateLog) writeFileHeader() error {
-	header, err := encodeFileHeader(s.meta, s.fileHeaderSize)
+func (s *StateLog[T]) writeFileHeader() error {
+	header, err := encodeFileHeader(s.schema, s.meta, s.fileHeaderSize)
 	if err != nil {
 		return err
 	}
@@ -221,14 +231,14 @@ func (s *StateLog) writeFileHeader() error {
 	return s.file.Sync()
 }
 
-func (s *StateLog) loadFileHeader() error {
+func (s *StateLog[T]) loadFileHeader() error {
 	f, err := os.Open(s.filePath)
 	if err != nil {
 		return &IOError{FilePath: s.filePath, Message: "open for header read", Err: err}
 	}
 	defer f.Close()
 
-	meta, headerSize, err := decodeFileHeader(f)
+	_, meta, headerSize, err := decodeFileHeader(f)
 	if err != nil {
 		return err
 	}
@@ -240,7 +250,7 @@ func (s *StateLog) loadFileHeader() error {
 // SetMeta sets a metadata key-value pair and persists it to the file header.
 // Supported value types: string, int, float64, bool, nil, and other
 // JSON-serializable types.
-func (s *StateLog) SetMeta(key string, value any) error {
+func (s *StateLog[T]) SetMeta(key string, value any) error {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
 
@@ -249,7 +259,7 @@ func (s *StateLog) SetMeta(key string, value any) error {
 }
 
 // Meta returns a shallow copy of the current metadata.
-func (s *StateLog) Meta() map[string]any {
+func (s *StateLog[T]) Meta() map[string]any {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
 
@@ -260,13 +270,13 @@ func (s *StateLog) Meta() map[string]any {
 	return cp
 }
 
-func (s *StateLog) lockFile() error {
+func (s *StateLog[T]) lockFile() error {
 	if err := syscall.Flock(int(s.file.Fd()), syscall.LOCK_EX); err != nil {
 		return &IOError{FilePath: s.filePath, Message: "acquire file lock", Err: err}
 	}
 	return nil
 }
 
-func (s *StateLog) unlockFile() {
+func (s *StateLog[T]) unlockFile() {
 	_ = syscall.Flock(int(s.file.Fd()), syscall.LOCK_UN)
 }

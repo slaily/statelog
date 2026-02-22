@@ -1,7 +1,6 @@
 package statelog
 
 import (
-	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,31 +9,41 @@ import (
 	"time"
 )
 
+type testRecord struct {
+	Name  string `sl:"32"`
+	Value string `sl:"32"`
+	Seq   uint64
+}
+
+type simpleRecord struct {
+	Msg string `sl:"64"`
+}
+
 func tempPath(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), "test.log")
 }
 
-func newTestLog(t *testing.T, opts ...Option) (*StateLog, string) {
+func newTestLog(t *testing.T, opts ...Option) (*StateLog[testRecord], string) {
 	t.Helper()
 	path := tempPath(t)
 	defaults := []Option{WithCommitInterval(10 * time.Millisecond)}
-	s, err := New(path, append(defaults, opts...)...)
+	s, err := New[testRecord](path, append(defaults, opts...)...)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return s, path
 }
 
-func collectRecords(t *testing.T, path string) []any {
+func collectRecords[T any](t *testing.T, path string) []T {
 	t.Helper()
-	r, err := NewReader(path)
+	r, err := NewReader[T](path)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
 	defer r.Close()
 
-	var records []any
+	var records []T
 	for r.Next() {
 		records = append(records, r.Record())
 	}
@@ -48,7 +57,7 @@ func TestAppendAndReplay(t *testing.T) {
 	s, path := newTestLog(t)
 
 	for i := 0; i < 10; i++ {
-		if err := s.Append(map[string]any{"i": float64(i)}); err != nil {
+		if err := s.Append(testRecord{Name: "i", Value: "v", Seq: uint64(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
@@ -56,48 +65,48 @@ func TestAppendAndReplay(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	records := collectRecords(t, path)
+	records := collectRecords[testRecord](t, path)
 	if len(records) != 10 {
 		t.Fatalf("expected 10 records, got %d", len(records))
 	}
 
 	for i, rec := range records {
-		m, ok := rec.(map[string]any)
-		if !ok {
-			t.Fatalf("record %d: expected map, got %T", i, rec)
-		}
-		if m["i"] != float64(i) {
-			t.Errorf("record %d: expected i=%d, got %v", i, i, m["i"])
+		if rec.Seq != uint64(i) {
+			t.Errorf("record %d: expected Seq=%d, got %d", i, i, rec.Seq)
 		}
 	}
 }
 
-func TestAppendString(t *testing.T) {
-	s, path := newTestLog(t)
+func TestAppendSimpleRecord(t *testing.T) {
+	path := tempPath(t)
+	s, err := New[simpleRecord](path, WithCommitInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
-	if err := s.Append("hello world"); err != nil {
+	if err := s.Append(simpleRecord{Msg: "hello world"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	records := collectRecords(t, path)
+	records := collectRecords[simpleRecord](t, path)
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(records))
 	}
-	if records[0] != "hello world" {
-		t.Errorf("expected 'hello world', got %v", records[0])
+	if records[0].Msg != "hello world" {
+		t.Errorf("expected 'hello world', got %q", records[0].Msg)
 	}
 }
 
-func TestAppendJSON(t *testing.T) {
+func TestAppendMultiField(t *testing.T) {
 	s, path := newTestLog(t)
 
-	data := map[string]any{
-		"event":   "user_login",
-		"user_id": float64(123),
-		"active":  true,
+	data := testRecord{
+		Name:  "user_login",
+		Value: "user-123",
+		Seq:   42,
 	}
 	if err := s.Append(data); err != nil {
 		t.Fatalf("Append: %v", err)
@@ -106,65 +115,63 @@ func TestAppendJSON(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	records := collectRecords(t, path)
+	records := collectRecords[testRecord](t, path)
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(records))
 	}
 
-	m := records[0].(map[string]any)
-	if m["event"] != "user_login" {
-		t.Errorf("expected event=user_login, got %v", m["event"])
+	rec := records[0]
+	if rec.Name != "user_login" {
+		t.Errorf("expected Name=user_login, got %q", rec.Name)
 	}
-	if m["user_id"] != float64(123) {
-		t.Errorf("expected user_id=123, got %v", m["user_id"])
+	if rec.Value != "user-123" {
+		t.Errorf("expected Value=user-123, got %q", rec.Value)
 	}
-	if m["active"] != true {
-		t.Errorf("expected active=true, got %v", m["active"])
+	if rec.Seq != 42 {
+		t.Errorf("expected Seq=42, got %d", rec.Seq)
 	}
 }
 
 func TestCorruptedRecordSkipped(t *testing.T) {
 	s, path := newTestLog(t)
 
-	if err := s.Append("first"); err != nil {
+	if err := s.Append(testRecord{Name: "first", Seq: 1}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	if err := s.Append("second"); err != nil {
+	if err := s.Append(testRecord{Name: "second", Seq: 2}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	if err := s.Append("third"); err != nil {
+	if err := s.Append(testRecord{Name: "third", Seq: 3}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Corrupt the checksum of the second record.
+	// Corrupt the CRC32 of the second record.
+	schema, _ := buildSchema[testRecord]()
+	secondRecordOffset := int64(defaultFileHeaderSize) + int64(schema.RecordSize)
+	// CRC32 is at DataSize offset within the record.
+	crcOffset := secondRecordOffset + int64(schema.DataSize)
+
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// File header: 512 bytes.
-	// First record: header(9) + "first"(5) = 14 bytes.
-	// Second record checksum is at offset 512+14+5 = 531 (bytes 5..9 of entry header).
-	offset := int64(defaultFileHeaderSize) + 14 + 5
-	var bad [4]byte
-	binary.LittleEndian.PutUint32(bad[:], 0xDEADBEEF)
-	if _, err := f.WriteAt(bad[:], offset); err != nil {
+	if _, err := f.WriteAt([]byte{0xDE, 0xAD, 0xBE, 0xEF}, crcOffset); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
 
-	records := collectRecords(t, path)
+	records := collectRecords[testRecord](t, path)
 	if len(records) != 2 {
 		t.Fatalf("expected 2 records (corrupt one skipped), got %d", len(records))
 	}
-	if records[0] != "first" {
-		t.Errorf("expected 'first', got %v", records[0])
+	if records[0].Name != "first" {
+		t.Errorf("expected 'first', got %q", records[0].Name)
 	}
-	if records[1] != "third" {
-		t.Errorf("expected 'third', got %v", records[1])
+	if records[1].Name != "third" {
+		t.Errorf("expected 'third', got %q", records[1].Name)
 	}
 }
 
@@ -172,7 +179,7 @@ func TestCloseFlushes(t *testing.T) {
 	s, path := newTestLog(t, WithCommitInterval(1*time.Hour))
 
 	for i := 0; i < 5; i++ {
-		if err := s.Append(map[string]any{"n": float64(i)}); err != nil {
+		if err := s.Append(testRecord{Name: "n", Seq: uint64(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
@@ -182,7 +189,7 @@ func TestCloseFlushes(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	records := collectRecords(t, path)
+	records := collectRecords[testRecord](t, path)
 	if len(records) != 5 {
 		t.Fatalf("expected 5 records after close, got %d", len(records))
 	}
@@ -192,14 +199,14 @@ func TestQueueFull(t *testing.T) {
 	s, _ := newTestLog(t, WithMaxQueueSize(2), WithCommitInterval(1*time.Hour))
 	defer s.Close()
 
-	if err := s.Append("a"); err != nil {
+	if err := s.Append(testRecord{Name: "a"}); err != nil {
 		t.Fatalf("first Append: %v", err)
 	}
-	if err := s.Append("b"); err != nil {
+	if err := s.Append(testRecord{Name: "b"}); err != nil {
 		t.Fatalf("second Append: %v", err)
 	}
 
-	err := s.Append("c")
+	err := s.Append(testRecord{Name: "c"})
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("expected ErrQueueFull, got %v", err)
 	}
@@ -211,7 +218,7 @@ func TestAppendAfterClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	err := s.Append("late")
+	err := s.Append(testRecord{Name: "late"})
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed, got %v", err)
 	}
@@ -223,7 +230,7 @@ func TestEmptyReplay(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r, err := NewReader(path)
+	r, err := NewReader[testRecord](path)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -240,7 +247,7 @@ func TestEmptyReplay(t *testing.T) {
 func TestFileRotation(t *testing.T) {
 	s, path := newTestLog(t)
 
-	if err := s.Append("before"); err != nil {
+	if err := s.Append(testRecord{Name: "before"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	// Wait for commit.
@@ -252,7 +259,7 @@ func TestFileRotation(t *testing.T) {
 		t.Fatalf("Rename: %v", err)
 	}
 
-	if err := s.Append("after"); err != nil {
+	if err := s.Append(testRecord{Name: "after"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -260,27 +267,27 @@ func TestFileRotation(t *testing.T) {
 	}
 
 	// The new file should contain only the "after" record.
-	records := collectRecords(t, path)
+	records := collectRecords[testRecord](t, path)
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record in new file, got %d", len(records))
 	}
-	if records[0] != "after" {
-		t.Errorf("expected 'after', got %v", records[0])
+	if records[0].Name != "after" {
+		t.Errorf("expected 'after', got %q", records[0].Name)
 	}
 
 	// The rotated file should contain "before".
-	rotatedRecords := collectRecords(t, rotated)
+	rotatedRecords := collectRecords[testRecord](t, rotated)
 	if len(rotatedRecords) != 1 {
 		t.Fatalf("expected 1 record in rotated file, got %d", len(rotatedRecords))
 	}
-	if rotatedRecords[0] != "before" {
-		t.Errorf("expected 'before', got %v", rotatedRecords[0])
+	if rotatedRecords[0].Name != "before" {
+		t.Errorf("expected 'before', got %q", rotatedRecords[0].Name)
 	}
 }
 
 func TestFunctionalOptions(t *testing.T) {
 	path := tempPath(t)
-	s, err := New(path,
+	s, err := New[testRecord](path,
 		WithCommitInterval(50*time.Millisecond),
 		WithMaxQueueSize(500),
 	)
@@ -310,9 +317,9 @@ func TestConcurrentAppends(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				_ = s.Append(map[string]any{
-					"goroutine": float64(id),
-					"seq":       float64(i),
+				_ = s.Append(testRecord{
+					Name: "goroutine",
+					Seq:  uint64(id*perGoroutine + i),
 				})
 			}
 		}(g)
@@ -323,41 +330,21 @@ func TestConcurrentAppends(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	records := collectRecords(t, path)
+	records := collectRecords[testRecord](t, path)
 	expected := goroutines * perGoroutine
 	if len(records) != expected {
 		t.Fatalf("expected %d records, got %d", expected, len(records))
 	}
 }
 
-func TestMixedTypes(t *testing.T) {
-	s, path := newTestLog(t)
+func TestStringTooLong(t *testing.T) {
+	s, _ := newTestLog(t)
+	defer s.Close()
 
-	if err := s.Append("a string record"); err != nil {
-		t.Fatalf("Append string: %v", err)
-	}
-	if err := s.Append(map[string]any{"key": "value"}); err != nil {
-		t.Fatalf("Append map: %v", err)
-	}
-	if err := s.Append("another string"); err != nil {
-		t.Fatalf("Append string: %v", err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	records := collectRecords(t, path)
-	if len(records) != 3 {
-		t.Fatalf("expected 3 records, got %d", len(records))
-	}
-	if records[0] != "a string record" {
-		t.Errorf("record 0: got %v", records[0])
-	}
-	m, ok := records[1].(map[string]any)
-	if !ok || m["key"] != "value" {
-		t.Errorf("record 1: got %v", records[1])
-	}
-	if records[2] != "another string" {
-		t.Errorf("record 2: got %v", records[2])
+	// testRecord.Name is sl:"32", so 33 bytes should fail.
+	longName := "this-string-is-way-too-long-for-32"
+	err := s.Append(testRecord{Name: longName})
+	if err == nil {
+		t.Fatal("expected error for string exceeding max size")
 	}
 }

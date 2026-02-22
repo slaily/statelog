@@ -110,7 +110,7 @@ func TestMetadataOverflow(t *testing.T) {
 	s, _ := newTestLog(t)
 	defer s.Close()
 
-	// A single large value that exceeds 499 bytes of available JSON space.
+	// A single large value that exceeds the available meta space.
 	bigValue := strings.Repeat("x", 500)
 	err := s.SetMeta("big", bigValue)
 	if !errors.Is(err, ErrMetadataOverflow) {
@@ -124,7 +124,7 @@ func TestReadMetaStandalone(t *testing.T) {
 	if err := s.SetMeta("standalone", "test"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
 	}
-	if err := s.Append("entry1"); err != nil {
+	if err := s.Append(testRecord{Name: "entry1"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -146,14 +146,14 @@ func TestReaderExposesMetadata(t *testing.T) {
 	if err := s.SetMeta("reader_key", "reader_val"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
 	}
-	if err := s.Append("data"); err != nil {
+	if err := s.Append(testRecord{Name: "data"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	r, err := NewReader(path)
+	r, err := NewReader[testRecord](path)
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -168,8 +168,8 @@ func TestReaderExposesMetadata(t *testing.T) {
 	if !r.Next() {
 		t.Fatal("expected one record")
 	}
-	if r.Record() != "data" {
-		t.Errorf("expected 'data', got %v", r.Record())
+	if r.Record().Name != "data" {
+		t.Errorf("expected 'data', got %q", r.Record().Name)
 	}
 }
 
@@ -189,7 +189,7 @@ func TestInvalidMagicBytes(t *testing.T) {
 	}
 	f.Close()
 
-	_, err = NewReader(path)
+	_, err = NewReader[testRecord](path)
 	if err == nil {
 		t.Fatal("expected error for invalid magic bytes")
 	}
@@ -210,14 +210,25 @@ func TestCorruptMetadataCRC(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Corrupt the CRC32 field (bytes 9-12 in the header).
+	// Find the CRC32 position in the new header format.
+	// The CRC is after: preamble(12) + schema bytes + metaUsed(2).
+	// We'll just corrupt a byte in the meta JSON area, which will cause CRC mismatch.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Read the full header to find the meta CRC offset.
+	header := make([]byte, defaultFileHeaderSize)
+	if _, err := f.ReadAt(header, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Decode enough to find the CRC position.
+	schema, _ := buildSchema[testRecord]()
+	schemaBytes := encodeSchema(schema)
+	crcOffset := int64(fileHeaderPreambleSize + len(schemaBytes) + 2) // +2 for metaUsed
 	var bad [4]byte
 	binary.LittleEndian.PutUint32(bad[:], 0xDEADBEEF)
-	if _, err := f.WriteAt(bad[:], 9); err != nil {
+	if _, err := f.WriteAt(bad[:], crcOffset); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
@@ -239,7 +250,7 @@ func TestMetaSurvivesRotation(t *testing.T) {
 	if err := s.SetMeta("job_id", "persist"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
 	}
-	if err := s.Append("before"); err != nil {
+	if err := s.Append(testRecord{Name: "before"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -250,7 +261,7 @@ func TestMetaSurvivesRotation(t *testing.T) {
 		t.Fatalf("Rename: %v", err)
 	}
 
-	if err := s.Append("after"); err != nil {
+	if err := s.Append(testRecord{Name: "after"}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	if err := s.Close(); err != nil {

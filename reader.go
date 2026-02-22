@@ -6,10 +6,10 @@ import (
 	"os"
 )
 
-// Reader iterates over log entries using the Iterator pattern.
+// Reader iterates over log records using the Iterator pattern.
 // Usage follows the bufio.Scanner convention:
 //
-//	r, err := statelog.NewReader("app.log")
+//	r, err := statelog.NewReader[Event]("app.log")
 //	if err != nil { ... }
 //	defer r.Close()
 //
@@ -17,24 +17,19 @@ import (
 //	    fmt.Println(r.Record())
 //	}
 //	if err := r.Err(); err != nil { ... }
-type Reader struct {
+type Reader[T any] struct {
 	file         *os.File
 	snapshotSize int64
-	encoder      Encoder
+	schema       *Schema
 	pos          int64
-	current      any
+	current      T
 	err          error
 	meta         map[string]any
 }
 
 // NewReader opens filePath for reading and takes a size snapshot for
 // consistent iteration. Records appended after this call are not visible.
-func NewReader(filePath string, opts ...ReaderOption) (*Reader, error) {
-	cfg := defaultReaderConfig()
-	for _, o := range opts {
-		o(&cfg)
-	}
-
+func NewReader[T any](filePath string) (*Reader[T], error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return nil, &IOError{FilePath: filePath, Message: "stat log file", Err: err}
@@ -45,7 +40,7 @@ func NewReader(filePath string, opts ...ReaderOption) (*Reader, error) {
 		return nil, &IOError{FilePath: filePath, Message: "open log file for reading", Err: err}
 	}
 
-	meta, headerSize, err := decodeFileHeader(f)
+	schema, meta, headerSize, err := decodeFileHeader(f)
 	if err != nil {
 		f.Close()
 		if ce, ok := err.(*CorruptionError); ok {
@@ -54,38 +49,40 @@ func NewReader(filePath string, opts ...ReaderOption) (*Reader, error) {
 		return nil, err
 	}
 
-	if _, err := f.Seek(int64(headerSize), io.SeekStart); err != nil {
-		f.Close()
-		return nil, &IOError{FilePath: filePath, Message: "seek past file header", Err: err}
-	}
-
-	return &Reader{
+	return &Reader[T]{
 		file:         f,
 		snapshotSize: info.Size(),
-		encoder:      cfg.encoder,
+		schema:       schema,
 		pos:          int64(headerSize),
 		meta:         meta,
 	}, nil
 }
 
-// Next advances to the next valid record. Corrupted entries are silently
+// Next advances to the next valid record. Corrupted records are silently
 // skipped. Returns false when the end of the snapshot is reached or an
 // unrecoverable error occurs.
-func (r *Reader) Next() bool {
+func (r *Reader[T]) Next() bool {
 	for {
-		if r.pos+entryHeaderSize > r.snapshotSize {
+		if r.pos+int64(r.schema.RecordSize) > r.snapshotSize {
 			return false
 		}
 
-		record, consumed, err := parseEntry(r.file, r.encoder, r.pos)
-		r.pos += int64(consumed)
+		buf := make([]byte, r.schema.RecordSize)
+		n, err := r.file.ReadAt(buf, r.pos)
+		if err != nil && err != io.EOF {
+			r.err = &IOError{Message: "read record", Err: err}
+			return false
+		}
+		if n < int(r.schema.RecordSize) {
+			return false
+		}
+
+		record, err := decodeRecord[T](r.schema, buf, r.pos)
+		r.pos += int64(r.schema.RecordSize)
 
 		if err != nil {
 			var ce *CorruptionError
 			if errors.As(err, &ce) {
-				if errors.Is(ce.Err, io.EOF) || errors.Is(ce.Err, io.ErrUnexpectedEOF) {
-					return false
-				}
 				continue
 			}
 			r.err = err
@@ -97,14 +94,14 @@ func (r *Reader) Next() bool {
 	}
 }
 
-// Record returns the most recently read log entry.
-func (r *Reader) Record() any { return r.current }
+// Record returns the most recently read log record.
+func (r *Reader[T]) Record() T { return r.current }
 
 // Err returns the first non-corruption error encountered during iteration.
-func (r *Reader) Err() error { return r.err }
+func (r *Reader[T]) Err() error { return r.err }
 
 // Meta returns a shallow copy of the file-level metadata from the header.
-func (r *Reader) Meta() map[string]any {
+func (r *Reader[T]) Meta() map[string]any {
 	cp := make(map[string]any, len(r.meta))
 	for k, v := range r.meta {
 		cp[k] = v
@@ -113,4 +110,4 @@ func (r *Reader) Meta() map[string]any {
 }
 
 // Close releases the underlying file handle.
-func (r *Reader) Close() error { return r.file.Close() }
+func (r *Reader[T]) Close() error { return r.file.Close() }
