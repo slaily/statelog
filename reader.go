@@ -24,6 +24,7 @@ type Reader struct {
 	pos          int64
 	current      any
 	err          error
+	meta         map[string]any
 }
 
 // NewReader opens filePath for reading and takes a size snapshot for
@@ -44,10 +45,26 @@ func NewReader(filePath string, opts ...ReaderOption) (*Reader, error) {
 		return nil, &IOError{FilePath: filePath, Message: "open log file for reading", Err: err}
 	}
 
+	meta, headerSize, err := decodeFileHeader(f)
+	if err != nil {
+		f.Close()
+		if ce, ok := err.(*CorruptionError); ok {
+			ce.FilePath = filePath
+		}
+		return nil, err
+	}
+
+	if _, err := f.Seek(int64(headerSize), io.SeekStart); err != nil {
+		f.Close()
+		return nil, &IOError{FilePath: filePath, Message: "seek past file header", Err: err}
+	}
+
 	return &Reader{
 		file:         f,
 		snapshotSize: info.Size(),
 		encoder:      cfg.encoder,
+		pos:          int64(headerSize),
+		meta:         meta,
 	}, nil
 }
 
@@ -56,7 +73,7 @@ func NewReader(filePath string, opts ...ReaderOption) (*Reader, error) {
 // unrecoverable error occurs.
 func (r *Reader) Next() bool {
 	for {
-		if r.pos+headerSize > r.snapshotSize {
+		if r.pos+entryHeaderSize > r.snapshotSize {
 			return false
 		}
 
@@ -85,6 +102,15 @@ func (r *Reader) Record() any { return r.current }
 
 // Err returns the first non-corruption error encountered during iteration.
 func (r *Reader) Err() error { return r.err }
+
+// Meta returns a shallow copy of the file-level metadata from the header.
+func (r *Reader) Meta() map[string]any {
+	cp := make(map[string]any, len(r.meta))
+	for k, v := range r.meta {
+		cp[k] = v
+	}
+	return cp
+}
 
 // Close releases the underlying file handle.
 func (r *Reader) Close() error { return r.file.Close() }

@@ -6,8 +6,10 @@ package statelog
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -15,15 +17,18 @@ import (
 
 // StateLog is a durable, append-only log backed by a binary file on disk.
 type StateLog struct {
-	filePath string
-	file     *os.File
-	inode    uint64
-	encoder  Encoder
-	queue    chan any
-	done     chan struct{}
-	stopped  chan struct{}
-	closed   atomic.Bool
-	cfg      config
+	filePath       string
+	file           *os.File
+	inode          uint64
+	encoder        Encoder
+	queue          chan any
+	done           chan struct{}
+	stopped        chan struct{}
+	closed         atomic.Bool
+	cfg            config
+	meta           map[string]any
+	metaMu         sync.Mutex
+	fileHeaderSize uint16
 }
 
 // New creates a StateLog that writes to filePath. The parent directory is
@@ -45,12 +50,14 @@ func New(filePath string, opts ...Option) (*StateLog, error) {
 	}
 
 	s := &StateLog{
-		filePath: absPath,
-		encoder:  cfg.encoder,
-		queue:    make(chan any, cfg.maxQueueSize),
-		done:     make(chan struct{}),
-		stopped:  make(chan struct{}),
-		cfg:      cfg,
+		filePath:       absPath,
+		encoder:        cfg.encoder,
+		queue:          make(chan any, cfg.maxQueueSize),
+		done:           make(chan struct{}),
+		stopped:        make(chan struct{}),
+		cfg:            cfg,
+		meta:           make(map[string]any),
+		fileHeaderSize: defaultFileHeaderSize,
 	}
 
 	if err := s.reopenFile(); err != nil {
@@ -142,6 +149,10 @@ func (s *StateLog) syncToDisk(entries [][]byte) error {
 		return err
 	}
 
+	if _, err := s.file.Seek(0, io.SeekEnd); err != nil {
+		return &IOError{FilePath: s.filePath, Message: "seek to end", Err: err}
+	}
+
 	for _, entry := range entries {
 		if _, err := s.file.Write(entry); err != nil {
 			return &IOError{FilePath: s.filePath, Message: "write entry", Err: err}
@@ -177,7 +188,7 @@ func (s *StateLog) reopenFile() error {
 		s.file.Close()
 	}
 
-	f, err := os.OpenFile(s.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.filePath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return &IOError{FilePath: s.filePath, Message: "open log file", Err: err}
 	}
@@ -192,7 +203,61 @@ func (s *StateLog) reopenFile() error {
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		s.inode = stat.Ino
 	}
+
+	if info.Size() == 0 {
+		return s.writeFileHeader()
+	}
+	return s.loadFileHeader()
+}
+
+func (s *StateLog) writeFileHeader() error {
+	header, err := encodeFileHeader(s.meta, s.fileHeaderSize)
+	if err != nil {
+		return err
+	}
+	if _, err := s.file.WriteAt(header, 0); err != nil {
+		return &IOError{FilePath: s.filePath, Message: "write file header", Err: err}
+	}
+	return s.file.Sync()
+}
+
+func (s *StateLog) loadFileHeader() error {
+	f, err := os.Open(s.filePath)
+	if err != nil {
+		return &IOError{FilePath: s.filePath, Message: "open for header read", Err: err}
+	}
+	defer f.Close()
+
+	meta, headerSize, err := decodeFileHeader(f)
+	if err != nil {
+		return err
+	}
+	s.meta = meta
+	s.fileHeaderSize = headerSize
 	return nil
+}
+
+// SetMeta sets a metadata key-value pair and persists it to the file header.
+// Supported value types: string, int, float64, bool, nil, and other
+// JSON-serializable types.
+func (s *StateLog) SetMeta(key string, value any) error {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+
+	s.meta[key] = value
+	return s.writeFileHeader()
+}
+
+// Meta returns a shallow copy of the current metadata.
+func (s *StateLog) Meta() map[string]any {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+
+	cp := make(map[string]any, len(s.meta))
+	for k, v := range s.meta {
+		cp[k] = v
+	}
+	return cp
 }
 
 func (s *StateLog) lockFile() error {

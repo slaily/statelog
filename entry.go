@@ -7,7 +7,7 @@ import (
 	"io"
 )
 
-const headerSize = 9 // 4 (payload size) + 1 (type flag) + 4 (crc32)
+const entryHeaderSize = 9 // 4 (payload size) + 1 (type flag) + 4 (crc32)
 
 // formatEntry serializes data into a binary log entry.
 //
@@ -21,11 +21,11 @@ func formatEntry(enc Encoder, data any) ([]byte, error) {
 	checksum := crc32.ChecksumIEEE(payload)
 	payloadSize := uint32(len(payload))
 
-	entry := make([]byte, headerSize+len(payload))
+	entry := make([]byte, entryHeaderSize+len(payload))
 	binary.LittleEndian.PutUint32(entry[0:4], payloadSize)
 	entry[4] = typeFlag
 	binary.LittleEndian.PutUint32(entry[5:9], checksum)
-	copy(entry[headerSize:], payload)
+	copy(entry[entryHeaderSize:], payload)
 
 	return entry, nil
 }
@@ -34,7 +34,7 @@ func formatEntry(enc Encoder, data any) ([]byte, error) {
 // along with the total bytes consumed. The offset parameter is used for error
 // reporting only.
 func parseEntry(r io.Reader, enc Encoder, offset int64) (any, int, error) {
-	var header [headerSize]byte
+	var header [entryHeaderSize]byte
 	n, err := io.ReadFull(r, header[:])
 	if err != nil {
 		reason := "incomplete header"
@@ -79,5 +79,5 @@ func parseEntry(r io.Reader, enc Encoder, offset int64) (any, int, error) {
 		}
 	}
 
-	return record, headerSize + int(payloadSize), nil
+	return record, entryHeaderSize + int(payloadSize), nil
 }

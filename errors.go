@@ -11,6 +11,9 @@ var (
 
 	// ErrQueueFull is returned when the write queue has reached capacity.
 	ErrQueueFull = errors.New("statelog: write queue is full")
+
+	// ErrMetadataOverflow is returned when metadata exceeds the reserved header space.
+	ErrMetadataOverflow = errors.New("statelog: metadata exceeds reserved header space")
 )
 
 // CorruptionError indicates a corrupt record was detected during reading.

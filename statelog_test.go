@@ -145,9 +145,10 @@ func TestCorruptedRecordSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// File header: 512 bytes.
 	// First record: header(9) + "first"(5) = 14 bytes.
-	// Second record checksum is at offset 14+5 = 19 (bytes 5..9 of header).
-	offset := int64(14 + 5) // skip to checksum field of second record header
+	// Second record checksum is at offset 512+14+5 = 531 (bytes 5..9 of entry header).
+	offset := int64(defaultFileHeaderSize) + 14 + 5
 	var bad [4]byte
 	binary.LittleEndian.PutUint32(bad[:], 0xDEADBEEF)
 	if _, err := f.WriteAt(bad[:], offset); err != nil {
@@ -217,12 +218,10 @@ func TestAppendAfterClose(t *testing.T) {
 }
 
 func TestEmptyReplay(t *testing.T) {
-	path := tempPath(t)
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
+	s, path := newTestLog(t)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
-	f.Close()
 
 	r, err := NewReader(path)
 	if err != nil {
