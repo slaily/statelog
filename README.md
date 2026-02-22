@@ -3,21 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/slaily/statelog.svg)](https://pkg.go.dev/github.com/slaily/statelog)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Durable state log for Go
-
-- **Durable.** Every flush calls fsync. Recover state after any crash.
-- **Fast.** Appends return immediately. Disk I/O never blocks the caller.
-- **Concurrent.** Goroutine-safe. File locking for multi-process safety.
-
-### Table of Contents
-
-- [statelog](#statelog)
-    - [Table of Contents](#table-of-contents)
-    - [Installation](#installation)
-    - [Quickstart](#quickstart)
-    - [API Reference](#api-reference)
-    - [Binary Format](#binary-format)
-    - [License](#license)
+Durable state log.
 
 ### Installation
 
